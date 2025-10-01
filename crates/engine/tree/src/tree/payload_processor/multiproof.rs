@@ -1217,8 +1217,10 @@ mod tests {
             executor.handle().clone(),
             config.consistent_view.clone(),
             task_ctx,
-            1,
-        );
+            1, // num_workers
+            1, // max_concurrency
+        )
+        .unwrap();
         let channel = channel();
 
         MultiProofTask::new(config, executor, proof_task.handle(), channel.0, 1, None)
