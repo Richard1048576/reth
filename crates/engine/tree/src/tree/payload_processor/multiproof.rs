@@ -18,7 +18,11 @@ use reth_trie::{
     updates::TrieUpdatesSorted, DecodedMultiProof, HashedPostState, HashedPostStateSorted,
     HashedStorage, MultiProofTargets, TrieInput,
 };
-use reth_trie_parallel::{proof::ParallelProof, proof_task::ProofTaskManagerHandle};
+use reth_trie_parallel::{
+    proof::ParallelProof,
+    proof_task::{AccountMultiproofInput, ProofTaskKind, ProofTaskManagerHandle},
+    root::ParallelStateRootError,
+};
 use std::{
     collections::{BTreeMap, VecDeque},
     ops::DerefMut,
@@ -348,7 +352,9 @@ pub struct MultiproofManager<Factory: DatabaseProviderFactory> {
     pending: VecDeque<PendingMultiproofTask<Factory>>,
     /// Executor for tasks
     executor: WorkloadExecutor,
-    /// Sender to the storage proof task.
+    /// Sender to the account proof task manager.
+    account_proof_task_handle: ProofTaskManagerHandle<FactoryTx<Factory>>,
+    /// Sender to the storage proof task manager.
     storage_proof_task_handle: ProofTaskManagerHandle<FactoryTx<Factory>>,
     /// Metrics
     metrics: MultiProofTaskMetrics,
@@ -362,6 +368,7 @@ where
     fn new(
         executor: WorkloadExecutor,
         metrics: MultiProofTaskMetrics,
+        account_proof_task_handle: ProofTaskManagerHandle<FactoryTx<Factory>>,
         storage_proof_task_handle: ProofTaskManagerHandle<FactoryTx<Factory>>,
         max_concurrent: usize,
     ) -> Self {
@@ -371,6 +378,7 @@ where
             executor,
             inflight: 0,
             metrics,
+            account_proof_task_handle,
             storage_proof_task_handle,
         }
     }
@@ -510,46 +518,60 @@ where
             state_root_message_sender,
             multi_added_removed_keys,
         } = multiproof_input;
-        let storage_proof_task_handle = self.storage_proof_task_handle.clone();
 
+        let account_targets = proof_targets.len();
+        let storage_targets = proof_targets.values().map(|slots| slots.len()).sum::<usize>();
+
+        trace!(
+            target: "engine::root",
+            proof_sequence_number,
+            ?proof_targets,
+            account_targets,
+            storage_targets,
+            ?source,
+            "Starting multiproof calculation",
+        );
+
+        // Create channel for receiving multiproof result from account manager
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        // Queue account multiproof to account manager
+        let account_input = AccountMultiproofInput::new(
+            proof_targets,
+            Arc::unwrap_or_clone(config.prefix_sets).freeze(),
+            true, // collect_branch_node_masks
+            multi_added_removed_keys,
+            self.storage_proof_task_handle.clone(),
+            result_tx,
+        );
+
+        if self
+            .account_proof_task_handle
+            .queue_task(ProofTaskKind::AccountMultiproof(Box::new(account_input)))
+            .is_err()
+        {
+            let _ = state_root_message_sender.send(MultiProofMessage::ProofCalculationError(
+                ParallelStateRootError::Other("account manager closed".into()).into(),
+            ));
+            return;
+        }
+
+        // Spawn receiver task to handle the result
         self.executor.spawn_blocking(move || {
-            let account_targets = proof_targets.len();
-            let storage_targets = proof_targets.values().map(|slots| slots.len()).sum::<usize>();
-
-            trace!(
-                target: "engine::root",
-                proof_sequence_number,
-                ?proof_targets,
-                account_targets,
-                storage_targets,
-                ?source,
-                "Starting multiproof calculation",
-            );
-
             let start = Instant::now();
-            let proof_result = ParallelProof::new(
-                config.consistent_view,
-                config.nodes_sorted,
-                config.state_sorted,
-                config.prefix_sets,
-                storage_proof_task_handle.clone(),
-            )
-            .with_branch_node_masks(true)
-            .with_multi_added_removed_keys(multi_added_removed_keys)
-            .decoded_multiproof(proof_targets);
-            let elapsed = start.elapsed();
-            trace!(
-                target: "engine::root",
-                proof_sequence_number,
-                ?elapsed,
-                ?source,
-                account_targets,
-                storage_targets,
-                "Multiproof calculated",
-            );
+            match result_rx.recv() {
+                Ok(Ok(proof)) => {
+                    let elapsed = start.elapsed();
+                    trace!(
+                        target: "engine::root",
+                        proof_sequence_number,
+                        ?elapsed,
+                        ?source,
+                        account_targets,
+                        storage_targets,
+                        "Multiproof calculated",
+                    );
 
-            match proof_result {
-                Ok(proof) => {
                     let _ = state_root_message_sender.send(MultiProofMessage::ProofCalculated(
                         Box::new(ProofCalculated {
                             sequence_number: proof_sequence_number,
@@ -561,9 +583,15 @@ where
                         }),
                     ));
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     let _ = state_root_message_sender
                         .send(MultiProofMessage::ProofCalculationError(error.into()));
+                }
+                Err(_) => {
+                    let _ =
+                        state_root_message_sender.send(MultiProofMessage::ProofCalculationError(
+                            ParallelStateRootError::Other("account manager closed".into()).into(),
+                        ));
                 }
             }
         });
@@ -660,7 +688,8 @@ where
     pub(super) fn new(
         config: MultiProofConfig<Factory>,
         executor: WorkloadExecutor,
-        proof_task_handle: ProofTaskManagerHandle<FactoryTx<Factory>>,
+        account_proof_task_handle: ProofTaskManagerHandle<FactoryTx<Factory>>,
+        storage_proof_task_handle: ProofTaskManagerHandle<FactoryTx<Factory>>,
         to_sparse_trie: Sender<SparseTrieUpdate>,
         max_concurrency: usize,
         chunk_size: Option<usize>,
@@ -680,7 +709,8 @@ where
             multiproof_manager: MultiproofManager::new(
                 executor,
                 metrics.clone(),
-                proof_task_handle,
+                account_proof_task_handle,
+                storage_proof_task_handle,
                 max_concurrency,
             ),
             metrics,
@@ -1213,17 +1243,36 @@ mod tests {
             config.state_sorted.clone(),
             config.prefix_sets.clone(),
         );
-        let proof_task = ProofTaskManager::new(
+        // Create both storage and account managers for testing
+        let storage_manager = ProofTaskManager::new(
+            executor.handle().clone(),
+            config.consistent_view.clone(),
+            task_ctx.clone(),
+            1, // storage_worker_count
+            0, // account_worker_count
+            1, // max_concurrency
+        )
+        .unwrap();
+        let account_manager = ProofTaskManager::new(
             executor.handle().clone(),
             config.consistent_view.clone(),
             task_ctx,
-            1, // num_workers
+            0, // storage_worker_count
+            1, // account_worker_count
             1, // max_concurrency
         )
         .unwrap();
         let channel = channel();
 
-        MultiProofTask::new(config, executor, proof_task.handle(), channel.0, 1, None)
+        MultiProofTask::new(
+            config,
+            executor,
+            account_manager.handle(),
+            storage_manager.handle(),
+            channel.0,
+            1,
+            None,
+        )
     }
 
     #[test]
