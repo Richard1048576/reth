@@ -882,7 +882,7 @@ where
                             consistent_view,
                             trie_input,
                             &self.config,
-                        ),
+                        )?,
                         StateRootStrategy::StateRootTask,
                     )
                 // if prefix sets are not empty, we spawn a task that exclusively handles cache
